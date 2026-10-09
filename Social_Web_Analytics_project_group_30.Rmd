@@ -1,0 +1,771 @@
+---
+pagetitle: "Social Web Analytics project"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 9, fig.height = 6)
+if (.Platform$OS.type == "windows") {
+  invisible(Sys.setlocale("LC_CTYPE", "Chinese (Simplified)_China.utf8"))
+}
+```
+
+```{r cover-page, echo=FALSE, results='asis'}
+group_members = data.frame(
+  "Group members" = c("Alexander Crosse", "Zhitian Zheng", "Colleen Rith", "Jeffrey Narayan"),
+  SID = c("22028762", "22050172", "22100599", "22148212"),
+  Contribution = rep("25%", 4),
+  check.names = FALSE
+)
+if (knitr::is_html_output()) {
+  cat('<style>.group-cover-table {width:100%; table-layout:fixed; border-collapse:collapse; margin:28px 0 40px;} .group-cover-table th, .group-cover-table td {border:1px solid #cccccc; padding:14px; text-align:left; background:white;} .group-cover-table th {font-weight:bold;} @media print {.project-cover {break-after:page; page-break-after:always;}}</style>\n')
+  cat('<div class="project-cover"><h1>Social Web Analytics project</h1>\n')
+  cover_table = knitr::kable(group_members, format="html", align="lll",
+                           table.attr='class="group-cover-table"')
+  cat(sub('<thead>', '<thead><tr><th colspan="3">Group30</th></tr>', cover_table))
+  cat('\n</div>\n')
+} else {
+  cat('# Social Web Analytics project\n\n**Group30**\n\n')
+  cat(knitr::kable(group_members, format="pipe", align="lll"), sep="\n")
+  cat('\n\n\\newpage\n')
+}
+```
+
+```{r packages, message=FALSE}
+library(dplyr)
+library(tidytext)
+library(ggplot2)
+library(stringr)
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(igraph)
+library(kableExtra)
+```
+
+# 2.1 Data Collection
+
+Public Bluesky posts were collected in R using the Bluesky API (`atrrr`, `dplyr`). We searched for "AI" and "Artificial Intelligence" with the English-language filter from 25 September to 1 October 2026 (UTC), using six-hour windows and randomly retaining up to 50 eligible posts per keyword per window.
+
+The saved collection contains 2,779 unique posts. Cleaning retains 2,686 posts from 2,088 authors. The analysis uses post and author IDs, text, hashtags, timestamps, and counts of likes, reposts and replies. API search limits and keyword sampling mean that this collection does not represent every AI-related post or all Bluesky users.
+
+```{r data-collection}
+# 2.1 Data Collection
+collect_again = FALSE
+data_dir = "data"
+raw_file = file.path(data_dir, "ai_posts.rds")
+
+
+# Set the UTC time interval and search keywords.
+start_time = as.POSIXct("2026-09-25 00:00:00", tz = "UTC")
+end_time = as.POSIXct("2026-10-02 00:00:00", tz = "UTC")
+queries = c("AI", '"Artificial Intelligence"')
+
+if (collect_again) {
+  library(atrrr)
+  library(dplyr)
+  windows = seq(start_time, end_time, by = "6 hours")
+  collected = list()
+  set.seed(3020)
+  for (w in 1:(length(windows) - 1)) {
+    for (q in queries) {
+      result = search_skeet(q = q, sort = "latest", lang = "en", limit = 100,
+                             since = windows[w], until = windows[w + 1],
+                             parse = TRUE)
+      matched = !is.na(result$text) & grepl(
+        "\\bAI\\b|\\bartificial[[:space:]]+intelligence\\b",
+        result$text, ignore.case = TRUE, perl = TRUE)
+      inside = !is.na(result$indexed_at) & result$indexed_at >= windows[w] &
+               result$indexed_at < windows[w + 1]
+      eligible = result[matched & inside & !duplicated(result$uri), ]
+      if (nrow(eligible) > 0) {
+        chosen = sample.int(nrow(eligible), min(50, nrow(eligible)))
+        collected[[length(collected) + 1]] = eligible[chosen, ]
+      }
+      Sys.sleep(1.5)
+    }
+  }
+  if (length(collected) == 0) stop("No eligible posts were collected.")
+  raw = as.data.frame(bind_rows(collected))
+  raw = raw[!duplicated(raw$uri), ]
+  raw$author_did = sub("^at://([^/]+)/.*$", "\\1", raw$uri)
+
+  raw$created_at_raw = vapply(raw$post_data, function(x) {
+    if (is.null(x$createdAt)) NA_character_ else as.character(x$createdAt)[1]
+  }, character(1))
+  data_dir = file.path("data", paste0("collection_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+  if (dir.exists(data_dir)) stop("The output directory already exists. Run again later.")
+  dir.create(data_dir, recursive = TRUE)
+  saveRDS(raw, file.path(data_dir, "ai_posts.rds"))
+} else {
+  if (!file.exists(raw_file)) stop("Missing data/ai_posts.rds. Extract the complete project folder first.")
+  raw = as.data.frame(readRDS(raw_file))
+
+}
+
+# 2.1 Data Cleaning
+cat("Raw posts:", nrow(raw), "\n")
+posts = raw[!is.na(raw$text) & !duplicated(raw$uri), ]
+# Exclude records containing characters matched by the CJK filter.
+cjk = grepl("[\\x{3040}-\\x{30ff}\\x{4e00}-\\x{9fff}]", posts$text, perl = TRUE)
+cat("Excluded by the character filter:", sum(cjk), "\n")
+posts = posts[!cjk, ]
+created = sub("Z$", "+0000", posts$created_at_raw)
+created = sub("([+-][0-9]{2}):([0-9]{2})$", "\\1\\2", created)
+created = as.POSIXct(created, format = "%Y-%m-%dT%H:%M:%OS%z", tz = "UTC")
+keep_time = !is.na(created) & created >= start_time & created < end_time
+cat("Excluded by the creation-time filter:", sum(!keep_time), "\n")
+posts = posts[keep_time, ]
+cat("Extra copies of identical text:", sum(duplicated(posts$text)), "\n")
+posts = posts[!duplicated(posts$text), ]
+
+# Randomly select one post per author, then sample up to 200 posts for annotation.
+set.seed(3020)
+shuffled = sample.int(nrow(posts))
+one_per_author = shuffled[!duplicated(posts$author_did[shuffled])]
+review_ids = one_per_author[sample.int(length(one_per_author), min(200, length(one_per_author)))]
+review = posts[review_ids, c("uri", "author_did", "text", "indexed_at")]
+review$topic = ""
+review$attitude = ""
+
+saveRDS(posts, file.path(data_dir, "ai_posts_clean.rds"))
+write.csv(review, file.path(data_dir, "annotation_sample_200.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+labels_file = file.path(data_dir, "annotation_sample_200_labeled.csv")
+print(dim(posts))
+print(head(posts[, c("text", "like_count", "repost_count")], 3))
+
+# 2.1 Data Volume and Variable Summary
+cat("Posts:", nrow(posts), "\n")
+cat("Authors:", length(unique(posts$author_did)), "\n")
+print(summary(posts[, c("like_count", "repost_count", "reply_count")]))
+```
+
+# 2.2 Hypothesis Testing
+
+**Research question:** Is expressed attitude toward AI associated with the topic of a post?
+
+**H0:** Topic and attitude are independent. **H1:** Topic and attitude are associated.
+
+We use a chi-squared test because both variables are categorical. A simulated p-value is used because some expected counts are small. The labelled sample contains 200 posts, with one post per author; 151 posts fall into the three selected topics and positive, negative or neutral attitudes. The labels were AI-assisted, with 10 posts human-reviewed.
+
+```{r hypothesis-test}
+# 2.2 Chi-Squared Test of Topic and Attitude
+if (!file.exists(labels_file)) {
+  stop("Missing annotation_sample_200_labeled.csv for this collection. Label the saved annotation sample before testing.")
+}
+labels = read.csv(labels_file, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+if (!all(c("uri", "topic", "attitude", "human_verified") %in% names(labels))) {
+  stop("Select annotation_sample_200_labeled.csv containing topic and attitude labels.")
+}
+if (anyDuplicated(labels$uri)) stop("The label file contains duplicate post URIs.")
+if (!all(labels$uri %in% posts$uri)) stop("Some labelled posts are not in the cleaned collection.")
+# If an annotation sample has been generated, check that its URIs match the label file.
+
+if (exists("review") && !setequal(labels$uri, review$uri)) {
+  stop("The labels do not match the current sample. Use the label file for this sample.")
+}
+cat("Labeled posts:", nrow(labels), "\n")
+cat("Human-reviewed posts:", sum(labels$human_verified, na.rm = TRUE), "\n")
+# Keep the three topics and positive, negative, and neutral attitudes.
+selected = labels[labels$topic %in% c("policy", "business", "applications") &
+                  labels$attitude %in% c("positive", "negative", "neutral"), ]
+selected$topic = factor(selected$topic,
+                        levels = c("policy", "business", "applications"))
+selected$attitude = factor(selected$attitude,
+                           levels = c("positive", "negative", "neutral"))
+counts = table(selected$topic, selected$attitude)
+print(counts)
+cat("Included in the test:", nrow(selected), "; excluded:", nrow(labels) - nrow(selected), "\n")
+
+# Plot attitude proportions within each topic.
+barplot(t(prop.table(counts, 1)),
+        col = c("seagreen", "tomato", "lightgray"),
+        legend.text = c("Positive", "Negative", "Neutral"),
+        args.legend = list(x = "topright", bty = "n", cex = 0.8),
+        ylim = c(0, 1.3), main = "Attitude within each topic",
+        ylab = "Proportion", names.arg = rownames(counts))
+
+
+set.seed(3020)
+test = chisq.test(counts, simulate.p.value = TRUE, B = 99999)
+print(test$expected)
+print(test)
+if (test$p.value < 0.05) {
+  cat("The current sample and labels provide evidence of an association between topic and attitude.\n")
+} else {
+  cat("The current sample and labels do not provide sufficient evidence of an association between topic and attitude.\n")
+}
+```
+
+# 2.3 Text/Content Analysis and Visualisation
+
+## 1. Load the two datasets 
+
+```{r group-01}
+# Select ai_posts_clean and Select annotation_sample_200_labeled.csv
+posts = readRDS(file.path(data_dir, "ai_posts_clean.rds"))
+labelled = read.csv(labels_file, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+```
+
+## 2. Define words to remove
+```{r group-02}
+# remove common english words and selected terms that add little topic information
+
+remove_words = c(stopwords("english"),
+                 "ai", "artificial",
+                 "intelligence",
+                 "http", "https", "www",
+                 "grothendieck", "co",
+                 "ahmedabad")
+
+# Keep negation words because they can affect the meaning of a sentence 
+
+remove_words = setdiff(remove_words, c("not", "no", "never"))
+```
+
+
+## 3. Clean words from all posts
+```{r group-03}
+# Split text into lowercase words, remove non-letter characters, and exclude single letters and unwanted words 
+
+clean_words = posts %>%
+  select(uri, text) %>%
+  unnest_tokens(word, text) %>%
+  mutate(word = gsub("[^a-z]", "", word)) %>%
+  filter(nchar(word) > 1, !word %in% remove_words)
+
+# Clean words from labelled posts
+clean_label_words = labelled %>%
+  select(sample_id, attitude, text) %>%
+  unnest_tokens(word, text) %>%
+  mutate(word = gsub("[^a-z]", "", word)) %>%
+  filter(nchar(word) > 1, !word %in% remove_words)
+```
+
+
+
+
+
+
+
+
+
+## 4. Count frequent words overall
+```{r group-04}
+# Count words and keep the top 20
+word_counts = clean_words %>% count(word, sort = TRUE)
+top_words = head(word_counts, 20)
+print(top_words)
+```
+The table shows the 20 most frequent words in the cleaned posts. "Not" has the highest count, while terms such as "technology", "openai" and "human" indicate topics related to AI and people. These counts measure total words occurrences, so one post can contribute several occurrences of the same word. 
+
+### Chart 1: Frequent words
+```{r group-05}
+ggplot(top_words, aes(x = word, y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "word", y = "frequencies")
+```
+
+In this graph, “Not” is the most frequent word overall which sppears approximately about 400 times followed by "can" and "trump". Words such as "technology", "openai" and "human" suggest that discussions include AI technology and its relationship with people. The frequent mention of "trump" also suggests a political element were involved. However, common words such as "just" "can" and the most frequent word, "not", provide limited information about the main topics, and word frequency alone cannot establish whether attitudes are positive or negative.
+
+## 5. Count posts in each attitude group
+```{r group-06}
+group_sizes = labelled %>% 
+  count(attitude, name = "total posts")
+
+# Count how many different posts contain each word
+# Keep positive and negative posts
+selected_words = clean_label_words %>% 
+  filter(attitude %in% c("positive", "negative"))
+
+# Count a word only once per post so repeated words do nt inflate the percentage
+unique_words = selected_words %>% 
+  distinct(sample_id, attitude, word)
+
+# Count posts containing each word 
+word_percent = unique_words %>% 
+  count(attitude, word, name = "posts_with_word")
+
+# Add the total number of posts in each attitude grup
+word_percent = left_join(word_percent, group_sizes, by = "attitude")
+
+# Calculate the percentage 
+word_percent = word_percent %>%
+  mutate(percent = posts_with_word/`total posts`*100)
+```
+
+
+## 6. select the top 10 words for each attitude
+```{r group-07}
+# Separate positive and negative words
+positive = word_percent %>%
+  filter(attitude == "positive")
+
+negative = word_percent %>%
+  filter(attitude == "negative")
+
+# Sort by percentage, highest first
+positive = arrange(positive, desc(percent))
+negative = arrange(negative, desc(percent))
+
+# Keep the top 10 words for each attitude 
+positive = head(positive, 10)
+negative = head(negative, 10)
+
+# Combine the 2 tables 
+top_attitude_words = rbind(positive, negative)
+print(top_attitude_words)
+
+```
+The table lists the ten words appearing in the largest percentage of posts within each attitude group. "Not" appears in approximately 27% of negative posts while "using", "future", "just" and "no" each appear in 30% of positive posts. Words such as "no" and "not" require sentence contxt to understand their meaning.
+
+### Chart 2: Words by attitude
+```{r group-08}
+ggplot(top_attitude_words, aes(x = word, y = percent)) +
+  geom_col() +
+  coord_flip() + # show a separate panel for each attitude, with its own word labels
+  facet_wrap(~ attitude, scales = "free_y") +
+  labs(x = "Word", y = "Percentage of posts")
+```
+
+In negative posts, "not" appears in approximately 27% of posts, followed by "like" at around 15%. In positive posts, "using", "future", "just" and "no" each appears in 30%. Terms such as "using", "language" and "agent" suggest that positive posts discuss AI applications, while "future" suggests interest in its potential. However, "not" and "no" appear in both groups, showing that these words do not automatically indicate a negative attitude. Theirmeaning depends on the surrounding setence. 
+
+## 7.Calculate TF-IDF using three combined attitude groups
+```{r group-09}
+# Keep the 3 attitude groups
+tfidf_words = clean_label_words %>%
+  filter(attitude %in% c("positive", "negative", "neutral"))
+
+tfidf_counts = tfidf_words %>% 
+  count(attitude, word)
+
+# Give more weight to words concentrated in fewer attitude groups 
+# Words appearing in all three groups receive an IDF of zero
+
+# Calculate TF-IDF
+tfidf_results = tfidf_counts %>%
+  bind_tf_idf(word, attitude, n)
+
+tfidf_results = arrange(tfidf_results, desc(tf_idf))
+```
+
+
+## 8. Select distinctive words for positive and negative attitudes
+```{r group-10}
+# Keep positive and negative words with non-zero TF-IDF scores 
+
+positive_tfidf = tfidf_results %>%
+  filter(attitude == "positive", tf_idf > 0)
+
+negative_tfidf = tfidf_results %>%
+  filter(attitude == "negative", tf_idf > 0)
+
+# Results are already sorted, so keep the first 10
+positive_tfidf = head(positive_tfidf, 10)
+negative_tfidf = head(negative_tfidf, 10)
+
+# Combine the tables
+top_tfidf = rbind(positive_tfidf, negative_tfidf)
+print(top_tfidf)
+```
+This table lists the ten highest-scoring words with non-zero TF-IDF values for each selected attitude. Positive terms include "scientists", mathematics" and 'editing", suggesting scientific and practical topics. Negative terms include "dath", "supposed" and "still", although their meaning requiresfurther context. These scores describe how distinctive words are within the labelled sample; they do not measure the strength of an attitude.
+
+### Chart 3: Distinctive words. Draw the TF-IDF chart
+```{r group-11}
+ggplot(top_tfidf, aes(x = word, y = tf_idf)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ attitude, scales = "free_y") +
+  labs(x = "Word",y = "TF–IDF score")
+
+```
+
+TF-IDF highlights words that distinguish the attitude groups. Positive posts contain distinctive terms such as "scientists", "mathematics", "editing" and "conversational", suggesting discussion of scientific and practical applications. Negative posts include "death", "supposed" and "still", which may reflect concerns or unmet expectations. However, terms such as "taxi" and "books" need further context. Higher TF-IDF scores indicate distinctiveness, rather than stronger sentiment or greater overall frequency.
+
+
+## Conclusion 
+
+Overall, the findings suggest that positive-labelled posts discuss AI's future and practical applications, while some negative-labelled posts may express concerns or doubts. However, individual words require sentence context to explain their meaning. These results describe the analysed sample and cannot represent of all Bluesky users.
+
+# 2.4 Clustering
+
+## Dataset loading
+```{r group-12}
+# Keep one complete text document per post.
+texts_AC <- posts$text
+
+# Remove missing or empty documents.
+valid_posts <- !is.na(texts_AC) & nzchar(trimws(texts_AC))
+texts_AC <- texts_AC[valid_posts]
+
+```
+
+
+## Dataset cleaning.
+
+```{r group-13}
+# Create the corpus.
+posts.corpus <- Corpus(VectorSource(texts_AC))
+
+#Convert characters to ASCII to reduce encoding inconsistencies.
+
+posts.corpus = tm_map(posts.corpus, function(x) iconv(x, to = "ASCII"))
+# Optional: remove URLs before punctuation removal so fragments such
+# as "https" and domain names do not become terms.
+remove_urls = content_transformer(function(x) {
+ gsub("https?://\\S+|www\\.\\S+", " ", x, perl = TRUE)
+ })
+# posts.corpus = tm_map(posts.corpus, remove_urls)
+# First three are known search terms and may otherwise dominate the results. The additions are to prevent profanity within the clouds. I apologise for the language.
+custom_words = c(
+"AI", "Artificial",
+"inteligence", 
+"arse", "ass", "bastard", "bitch", "bullshit", "crap", "cunt", "cock", "dick", "fuck", "shit"
+)
+posts.corpus = tm_map(posts.corpus, removeNumbers)
+posts.corpus = tm_map(posts.corpus, removePunctuation)
+posts.corpus = tm_map(posts.corpus, stripWhitespace)
+posts.corpus = tm_map(posts.corpus, tolower)
+# Remove standard English stop words and the custom stopwords.
+posts.corpus = tm_map(
+posts.corpus,
+removeWords,
+c(stopwords("english"), custom_words, tolower(custom_words))
+)
+
+# Reduce related word forms to a shared stem.
+posts.corpus = tm_map(posts.corpus, stemDocument)
+# stopwords("english")
+```
+
+The cleaning specific to the clustering was performed due to the separation of the words within the text analysis multiplying the computing power and time required to generate the visualisations.
+
+## Weighted matrix
+```{r group-14}
+# TermDocumentMatrix() stores terms in rows and documents in columns.
+posts.tdm = TermDocumentMatrix(posts.corpus)
+# TF-IDF reduces the influence of terms that occur in many documents
+# and gives more weight to terms that distinguish particular posts.
+posts.wtdm = weightTfIdf(posts.tdm)
+# Convert to a standard matrix and transpose it because the clustering
+# functions expect observations (documents) in rows.
+posts.matrix = t(as.matrix(posts.wtdm))
+# Cleaning may leave some posts with no terms. These zero rows cannot
+# contribute useful distance information, so they are removed.
+empties = which(rowSums(abs(posts.matrix)) == 0)
+if (length(empties) > 0) posts.matrix = posts.matrix[-empties, , drop = FALSE]
+dim(posts.matrix)
+```
+
+## Kmeans clustering
+```{r group-15}
+# Begin with one cluster to inspect the values returned by kmeans().
+number.of.clusters = 1
+K = kmeans(posts.matrix, number.of.clusters)
+# tot.withinss is the within-cluster sum of squares (SSW).
+K$tot.withinss
+```
+
+
+```{r group-16}
+ # With one cluster, SSW equals the total sum of squares (SST).
+K$totss
+```
+
+## Elbow plot: TF-IDF matrix
+```{r elbow-tfidf}
+set.seed(3020)
+n = 15
+SSW = rep(0, n)
+for (a in 1:n) {
+  K = kmeans(posts.matrix, a, nstart = 5)
+  SSW[a] = K$tot.withinss
+}
+plot(1:15, SSW, type = "b",
+     main = "Elbow Plot: TF-IDF Matrix",
+     xlab = "Number of Clusters",
+     ylab = "Within-Cluster Sum of Squares")
+```
+
+## Cosine Kmeans
+```{r group-17}
+# Divide each row by its length; this is the same normalization without a large diagonal matrix.
+norm.posts.matrix = posts.matrix / sqrt(rowSums(posts.matrix^2))
+# For unit vectors, squared Euclidean distance divided by two is equivalent to cosine distance.
+D = dist(norm.posts.matrix, method = "euclidean")^2/2
+```
+
+## Projection.
+```{r group-18}
+ # Count the available document vectors.
+N = dim(posts.matrix)[1]
+N
+```
+
+
+```{r group-19}
+# k-means only supports Euclidean geometry. MDS therefore projects the
+# cosine-distance relationships into a high-dimensional Euclidean space,
+# using many dimensions to limit information loss.
+mds.posts.matrix = cmdscale(D, k = 405)
+# D is an N by N document-distance matrix; mds.posts.matrix contains
+# the projected coordinates used by k-means.
+dim(as.matrix(D)) 
+```
+
+
+```{r group-20}
+dim(mds.posts.matrix)
+```
+
+## selecting clusters
+```{r group-21}
+set.seed(3020)
+n = 15
+SSW = rep(0, n)
+for (a in 1:n) {
+  K = kmeans(mds.posts.matrix, a, nstart = 5)
+  SSW[a] = K$tot.withinss
+}
+plot(1:15, SSW, type = "b",
+     main = "Elbow Plot: Euclidean K-means",
+     xlab = "Number of Clusters",
+     ylab = "Within-Cluster Sum of Squares")
+```
+
+A note to make here is that, while the elbow does emerge at approximately the 14 cluster mark, the amount of patterns that could be found from there would be lacking due to small sizing per cluster.
+As such, the cluster amount has been selected as 4.
+
+
+```{r group-22}
+K = kmeans(mds.posts.matrix, 4, nstart = 20)
+summary(K) 
+table(K$cluster)
+```
+```{r group-23}
+mds2.posts.matrix = cmdscale(D, k = 2)
+plot(mds2.posts.matrix, col = K$cluster)
+```
+
+
+Due to the above graph's lack of a suitable elbow curve, a manual adjustment of the number of graphs was utilised. Due to the lack of balancing between each of the cluster's amounts, primarily due to the cluster of >1000, 4 clusters were chosen, as it allows for each cluster to have some reasonable conclusions, as well as allowing the remainder of the clusters to have similar numbers to each other.
+This lack of leveling will also impact the results, as there will be substantial overlap in terms within both the visualisations and the tables.
+
+## visualisations.
+```{r group-24}
+# Cluster 1
+cluster.number = 1
+clusterpostsId = which(K$cluster == cluster.number)
+# Extract the original TF-IDF document vectors assigned to the cluster.
+clusterposts = posts.matrix[clusterpostsId, , drop = FALSE]
+# Average each term's TF-IDF weight across the cluster documents.
+# The highest means provide a compact description of the cluster.
+clusterTermWeight = colMeans(clusterposts) 
+sort(clusterTermWeight, decreasing = TRUE)[1:10]
+```
+```{r group-25}
+wordcloud(
+words = names(clusterTermWeight),
+freq = clusterTermWeight,
+min.freq = 0, # Mean TF-IDF weights are smaller than raw word counts.
+max.words = 100,
+random.order = FALSE,
+rot.per = 0.35,
+colors = brewer.pal(8, "Dark2"),
+scale = c(1, .5)
+)
+text(x = 0.5, y = 1.1, "Cluster 1") 
+```
+
+With primary words being Agent, openai, model and hack, with secondary being chatgpt, sytem and others, the main condern appears to be regarding how chatGPT could allow for an Agent to go rouge and cause issues as of late.
+This is backed by the tertiary words of Guardian, legal, monitor and australia, indicating that the is refering to the AI agents that ran loose and cause chaos though unexpected and unauthorised hacks.
+
+```{r group-26}
+# Repeat the same extraction and averaging process for all clusters.
+
+ # Cluster 2
+cluster.number = 2
+clusterpostsId2 = which(K$cluster == cluster.number)
+clusterposts2 = posts.matrix[clusterpostsId2, , drop = FALSE]
+clusterTermWeight2 = colMeans(clusterposts2)
+sort(clusterTermWeight2, decreasing = TRUE)[1:10]
+```
+```{r group-27}
+ wordcloud(
+words = names(clusterTermWeight2),
+freq = clusterTermWeight2,
+min.freq = 0, # Mean TF-IDF weights are smaller than raw word counts.
+max.words = 100,
+random.order = FALSE,
+rot.per = 0.35,
+colors = brewer.pal(8, "Dark2"),
+scale = c(2, .5)
+)
+text(x = 0.5, y = 1.1, "Cluster 2")
+```
+
+With the primary and secondary aspects of the 2nd and 3rd clusters being similar, there is a significant amount of overlay present. 
+However, a substantial amount of context appears to be derived from the tertiary words present, such as safety, china, republican and fear.
+This allows us to reasonably deduce that the concern is less around the environmental impacts of AI, but instead a worry over how differing nations could weaponise it though chatbots and trade and other potential methods.
+
+```{r group-28}
+ # Cluster 3
+cluster.number = 3
+clusterpostsId3 = which(K$cluster == cluster.number)
+clusterposts3 = posts.matrix[clusterpostsId3, , drop = FALSE]
+clusterTermWeight3 = colMeans(clusterposts3)
+sort(clusterTermWeight3, decreasing = TRUE)[1:10]
+```
+```{r group-29}
+ wordcloud(
+words = names(clusterTermWeight3),
+freq = clusterTermWeight3,
+min.freq = 0, # Mean TF-IDF weights are smaller than raw word counts.
+max.words = 100,
+random.order = FALSE,
+rot.per = 0.35,
+colors = brewer.pal(8, "Dark2"),
+scale = c(2, .5)
+)
+text(x = 0.5, y = 1.1, "Cluster 3")
+```
+
+The primary word here is Intelligence. However, this is present in the first 2 clusters as a major impact as well, though it has the biggest impact here. Additionally, secondary aspects lie in super, Mexico, gulf and term.
+These indicate that this is how the majority of the posts within the cluster have very little to do with the concerns over AI, and instead have a variety of topics, particularly in the realm of politics, that would concern a variety of people, such as President Trump attempting to rename the Gulf of Mexico.
+This is further indicated as several tertiary words include Netanyahu, rebrand and media. This indicates that the cluster refers to how Prime Minister Netanyahu had a connection to Donald Trump, as well as the surounding discussions and debates.
+
+```{r group-30}
+ # Cluster 4
+cluster.number = 4
+clusterpostsId4 = which(K$cluster == cluster.number)
+clusterposts4 = posts.matrix[clusterpostsId4, , drop = FALSE]
+clusterTermWeight4 = colMeans(clusterposts4)
+sort(clusterTermWeight4, decreasing = TRUE)[1:10]
+```
+```{r group-31}
+ wordcloud(
+words = names(clusterTermWeight4),
+freq = clusterTermWeight4,
+min.freq = 0, # Mean TF-IDF weights are smaller than raw word counts.
+max.words = 100,
+random.order = FALSE,
+rot.per = 0.35,
+colors = brewer.pal(8, "Dark2"),
+scale = c(2, .5)
+)
+text(x = 0.5, y = 1.1, "Cluster 4")
+```
+
+THe primary aspects are intelligence, human and people, with the secondary words including think, slop and generate. This leads to the conclusion that this cluster was centered around the topics of how generative AI is replacing the people's ability to think. This also indicates that the sentiment is poor due to the usage of 'slop'. Furthermore, the relative levels of each word is significantly closer than that of the other clusters.
+
+## Conclusion:
+
+Whilst the overlap of ideas withing the clusters was significant, several patterns emerge from within each cluster, from politics, to security to enviromental, these clusters prove that there is a variety of substantial impacts that surround AI, as evidenced on Bluesky.
+
+# 2.5 Network Analysis
+
+### Load dataset and data variables
+### Load required data for analysis in ai_posts_clean.rds
+```{r group-32}
+posts <- readRDS(file.path(data_dir, "ai_posts_clean.rds"))
+
+```
+
+### Building Hashtag Table
+```{r group-33}
+# Strips the tags of the hashtag, spaces, and makes characters the same, drops empty hashtags
+post_hashtags <- data.frame(
+  uri = rep(posts$uri, lengths(posts$tags)),
+  hashtags = as.character(unlist(posts$tags)),
+  stringsAsFactors = FALSE
+) %>%       
+  mutate(hashtags = sub("^#", "", tolower(trimws(hashtags)))) %>%
+  filter(!is.na(hashtags), hashtags != "") %>%  
+  distinct() 
+
+```
+
+
+### Defining Network Edges
+```{r group-34}
+ # Assigns a number to each hashtag to avoid duplicate edges and removes duplicated hashtags
+edges <- post_hashtags %>%
+  inner_join(post_hashtags, by = "uri", suffix = c("_1", "_2"), relationship = "many-to-many") %>%
+  filter(hashtags_1 < hashtags_2) %>%  
+  count(hashtags_1, hashtags_2, name="weight", sort = TRUE)
+```
+
+### Defining the Nodes and Graphs filters
+```{r group-35}
+nodes <- count(post_hashtags, hashtags, name = "post_frequency", sort = TRUE)
+
+# Filters for minimum co-occurrence of 4, edges, and the network
+minimum_cooccurrence <- 4L    
+
+edges_filtered <- filter(edges, weight >= minimum_cooccurrence)
+
+graph_after_filter <- graph_from_data_frame(edges_filtered, directed = FALSE)
+
+```
+
+### Calculate centrality scores and Hashtag Statistics
+```{r group-36}
+degree_centrality = degree(graph_after_filter)
+
+betweeness_centrality = betweenness(graph_after_filter, directed = FALSE, 
+                                    weights = 1 / E(graph_after_filter)$weight)
+
+# Matches hashtags in nodes and node_stats and adds post_frequency accordingly and filter out AI and artificial intelligence.
+node_stats <- data.frame(
+  hashtags = V(graph_after_filter)$name, 
+  degree_centrality = round(degree_centrality, 3),    
+  betweeness_centrality = round(betweeness_centrality, 3)
+) %>%
+  left_join(nodes, by = "hashtags") %>% 
+  filter(!hashtags %in% c("ai", "artificial intelligence", "artificialintelligence")) %>% 
+  arrange(desc(degree_centrality)) 
+```
+ 
+### Output statistics and centrality results
+```{r group-37}
+knitr::kable(head(node_stats, 10), caption = "Top 10 Hashtag Statistics") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "bordered", "condensed", "small"))
+
+knitr::kable(head(node_stats %>% arrange(desc(betweeness_centrality)), 5), caption = "Top 5 Hashtags with Highest Betweenness Centrality") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "bordered", "condensed", "small"))
+```
+The top 10 hashtag statistics highlight several topics associated with AI related posts on Bluesky including books, cognition, coherence, education, ethics, life, literacy, literature, and memory. These hashtags also have a degree centrality of 14 which are the highest scores in the network. This indicates that the hashtags appear on 14 posts alongside other hashtags used in AI discussions. The post frequencies section reveals how often the hashtags appear in AI related Bluesky. Additionally, the post frequencies vary with education having 9 posts and ethics having 5 posts as the second highest of the list. This may suggest that AI related discussions on Bluesky may reflect interest in AI's implications in education or ethics.
+
+The betweenness centrality results reveal that the news has the highest score with 55, suggesting that it connects various topics surrounding AI discussions. intelligence has the second highest betweenness centrality score of 1 whilst the rest have 0 showing that they do not act as a bridge between other vertices in the co-occurrence network. This highlights how topics such as news may connect multiple areas of AI discussions.
+
+These low frequencies are a result of the networks minimum co-occurrence being set to 4 to reduce clutter in the graph and remove less frequent connections. The general hashtags including 'ai' and 'artificialintelligence' were also excluded from the tables to highlight associated topics. 
+
+### Graph for Hashtag Co-occurrence Network and network statistics
+
+```{r group-38}
+set.seed(3020)
+
+# Plot co-occurrence network with thicker edges if there co-occurrece of pairs are higher
+plot(
+  graph_after_filter,
+  layout = layout_with_graphopt(graph_after_filter, charge = 0.1, spring.length = 190),
+  vertex.size = 5,
+  vertex.label.cex = 0.7,
+  vertex.label.color ="black",
+  vertex.label.dist = 0.6,
+  edge.width = 1 + log1p(E(graph_after_filter)$weight), #
+  main = "AI Hashtag Co-Occurrence Network"
+)
+
+cat("Nodes: ", vcount(graph_after_filter), "\n")
+cat("Edges: ", ecount(graph_after_filter), "\n")
+cat("Density: ", edge_density(graph_after_filter), "\n")
+
+```
+
+The AI hashtag co-occurrence network displays the relationships between hashtags that appear and are used in posts about AI related discussions. The edge thickness represents the frequency of co-occurring hashtag pairs. The main cluster consists of ai, artificial, intelligence, technology, and cognition showing that these terms most commonly connect different topics. Furthermore, it reveals how broader AI discussions overlap with ethical, political, cognitive, and application specific themes. 
+
+The outer clusters can reveal more specific interests of AI's implications with various topics such as farming, soil health, and radiology. This represent more specialised discussions that are less central and connected to other topics or hashtags. Additionally, the dense cluster of nodes in the center can indicate that certain hashtags serve more importance in linking together concepts than others. 
+
+Overall, this visualisation demonstrates the versatile nature of AI related discussions and how it can connect technological ideas with more broader ethical, social, political, and industry specific topics.
